@@ -1,0 +1,10 @@
+.DS_Store
+*.sublime*
+.Rproj.user
+.Rhistory
+.RData
+*.Rproj
+.Ruserdata
+stats
+behavioural_data.csv
+config.txt
