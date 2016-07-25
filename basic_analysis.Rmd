@@ -1,0 +1,279 @@
+---
+title: "Challenge for data science position"
+author: "John Lee"
+date: "15 February 2016"
+output: pdf_document
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+## Summary
+The objective of this analysis was to:
+    
+* Download data subjects in the Human Connectome Project; namely, statistical descriptions of MRI scans and demographic information. The data is stored on ConnectomeDB and an Amazon repository.
+* While controlling for total brain volume, perform a regression in order to assess the affect of both age and gender on the volume of each of 45 brain structures reported in the dataset.
+* Plot the beta weights of the resulting regression models for each factor.
+
+This analysis is compiled using the knitr package and RStudio (Version 0.99.865) on a Unix machine. The R Markdown file ('.Rmd') to generate the pdf is located in the same directory. In order to run a number of prerequisites exist.
+
+Essential information for working with the Human Connectome Project (HCP) data is the [documentation](http://humanconnectome.org/documentation/S900/) and the [wiki](https://wiki.humanconnectome.org/display/PublicData/Home). Guides to many of the prerequisites listed below are located in these helpful guides.
+
+
+## The analysis
+
+```{r load or install required libraries, warning=FALSE,results='hide'}
+for (package in c('stringr', 'ggplot2','dplyr',"readr","tidyr","purrr","broom")) {
+    if (!require(package, character.only=T, quietly=T,warn.conflicts = FALSE)) {
+        install.packages(package)
+        library(package,
+                quietly= TRUE,
+                warn.conflicts = FALSE)
+    }
+}
+```
+After loading the appropriate R packages the data is loaded.
+
+When querying the Amazon database using the s3cmd tool the .stat files for each subject were not always found. They are listed in the output below.
+
+```{r download and process .stat files and load demographic data,cache=TRUE}
+
+
+if (exists("fs_data_full")){rm("fs_data_full")}
+# Get a list of directory names to extract the subject ids for .stats file download/loading
+dir_list <- system2("s3cmd", args = c("ls", "s3://hcp-openaccess/HCP/"),stdout = T)
+subjects <- na.omit(str_extract(string = dir_list, pattern = "[0-9]{6}"))
+for (id in subjects){
+    file_name <- str_c("stats/",id,".stats") 
+    if (!file.exists(file_name)){
+        system2("s3cmd", args = c( "get",
+                           "-rv",
+                           "--include",
+                           "stats/aseg.stats",
+                           "--exclude",
+                           "'*'", 
+                           str_c("s3://hcp-openaccess/HCP/",
+                                 id,"/T1w/",id,"/"), 
+                           "."))
+        if (!file.exists("stats/aseg.stats")){
+            print(str_c("Stat file for Subject ", id, " not found"))
+            next
+        }else{file.rename("stats/aseg.stats",file_name)}
+    }
+    # Load the .stats file for this subject
+    fs_data <- read.table(file_name,header = FALSE)
+    names(fs_data) <- c("Index",
+        "SegId",
+        "NVoxels",
+        "Volume_mm3",
+        "StructName",
+        "normMean",
+        "normStdDev",
+        "normMin",
+        "normMax",
+        "normRange")
+    
+    
+    # Extract relevant variables for this subject
+    file_header <- readLines(file_name,100)
+    intra_entry <- file_header[str_detect(file_header,"Intra")]
+    tot_intra_cranial <-  as.numeric(str_extract(intra_entry,"(\\d+\\.\\d+)"))
+    fs_data <- tbl_df(fs_data) %>%
+        mutate(NormalisedVolume = Volume_mm3/tot_intra_cranial,
+               Subject = as.integer(id)) %>% 
+        select(StructName,NormalisedVolume,Subject)
+    
+    if(exists("fs_data_full")){fs_data_full <-
+        # merge current subject to full dataframe
+        rbind(fs_data_full,fs_data)}else{fs_data_full <- fs_data}
+}
+
+```
+
+The demographic data was downloaded as a csv file from the ConnectomeDB website and save to the local working directory. Some parsing failures occur on loading this data but they are not relevant to our analysis:
+
+```{r loading the demographic data}
+# could not programmatically download this file.
+# demographic data can be downloaded from ConnectomeDB after registering
+# https://db.humanconnectome.org/
+dem_data <- read_csv("behavioural_data.csv") %>% select(Subject,Gender,Age)
+
+```
+
+```{r merge datasets}
+common_subjects <- intersect(dem_data$Subject,fs_data_full$Subject)
+dem_data_filtered <- dem_data %>% 
+    filter(Subject %in% common_subjects)
+
+brain_and_demo <- fs_data_full %>% 
+    filter(Subject %in% common_subjects) %>% left_join(dem_data,by= "Subject")
+```
+`r length(common_subjects)` subjects were found in common in the two datasets. The subsequent analysis was performed on these subjects.
+
+The linear regression models were constructed using the youngest age group and females as intercept terms. Below the regression coefficient estimates (beta weights) are listed.
+
+```{r construct linear models}
+models <- brain_and_demo %>% 
+    group_by(StructName) %>% 
+    nest() %>% 
+    mutate(model = purrr::map(data, ~ lm(NormalisedVolume ~ Age+Gender, data = .))) %>%
+    unnest(model %>% purrr::map(broom::tidy))
+```
+
+Structures where gender has an effect with a significance of p<0.01 are reported:
+
+```{r gender effect}
+# listing structures where gender had a relatively large effect
+gender_effect <-  models %>%
+    select(StructName,term, estimate, p.value) %>% 
+    filter(term=="GenderM") %>%
+    arrange(p.value)
+     
+gender_effect %>%
+    filter(p.value<0.01) %>% 
+    print(n=100)
+```
+
+
+Structures where age has an effect with a significance of p<0.05 are reported:
+
+```{r}
+# listing structures where age had a relatively large effect
+age_effect <-  models %>%
+    select(StructName,term, estimate, p.value) %>% 
+    filter(term!="(Intercept)",term!="GenderM") %>%
+    arrange(p.value)
+     
+age_effect %>% 
+    filter(p.value<0.05) %>% 
+    print(n=100)
+
+```
+
+
+
+
+```{r plot for effect of age}
+age_effect <-  age_effect %>% 
+    arrange(estimate)
+
+# Sort structures according to the maximum estimate in descending order
+sorted_structures <- age_effect %>%
+ group_by(StructName) %>%
+ filter(estimate==max(estimate)) %>%
+ summarise( max_est=first(estimate)) %>%
+ arrange(desc(max_est)) %>%
+ .$StructName
+#no filter required above. just use summarise(max())
+
+
+# Draw the plot
+age_effect %>%
+ ggplot(aes(StructName,estimate))+
+ geom_bar(stat="identity",position="dodge",aes(color=term)) +
+ scale_x_discrete(limits = sorted_structures)+
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+ 
+xlab("Structure name")+ 
+ylab("Beta weight")+
+ggtitle("Effect of age on brain-structure volume")
+```
+
+
+```{r plot for effect of gender}
+# Statistics on the effect of gender
+gender_effect <- gender_effect %>% 
+    arrange(estimate)
+
+# Sort structures according to the maximum estimate in descending order
+sorted_structures <- gender_effect %>%
+ group_by(StructName) %>%
+ filter(estimate==max(estimate)) %>%
+ summarise( max_est=first(estimate)) %>%
+ arrange(desc(max_est)) %>%
+ .$StructName
+
+# Draw the plot
+gender_effect %>%
+ ggplot(aes(StructName,estimate))+
+ geom_bar(stat="identity",position="dodge",aes(color=term)) +
+ scale_x_discrete(limits = sorted_structures)+
+theme(axis.text.x = element_text(angle = 90, hjust = 1))+ 
+xlab("Structure name")+ 
+ylab("Beta weight")+
+ggtitle("Effect of gender on brain-structure volume")
+```
+
+```{r other stuff}
+# with_model <- by_structure %>%
+#     mutate(model = purrr::map(data, ~ lm(NormalisedVolume ~ Age, Gender = .)))
+# 
+# by_structure %>% 
+#   mutate(model = purrr::map(data, ~ lm(NormalisedVolume ~ Age-1, data = .))) %>% unnest(model %>% purrr::map(broom::tidy))   %>% ggplot()+geom_point(aes(x = StructName,y = estimate))
+
+# brain_and_demo %>%
+#     group_by(Age, Gender) %>%
+#     nest() %>%
+#     mutate(model = purrr::map(data, ~ lm(NormalisedVolume ~StructName-1, data = .))) %>%
+#     unnest(model %>% purrr::map(broom::tidy))   %>%
+#     ggplot()+geom_point(aes(x = StructName,y = estimate))
+```
+
+
+## Notes
+
+* I struggled quite a bit with getting the data. I've documented my attempts at downloading from the AWS server below. Regarding the demographic data I had a quick look at ascp, using REST etc. but I didn't have time to figure out the api for ConnectomeDB and so resorted to the manual download strategy in order to allow presentation of my skills in statistics, visualization, and reporting.
+
+* Reported p-values are not adjusted for multiple testing.
+
+## Prerequisites for successful compilation of the Rmd file.
+
+#### Working with the analysis files
+Extract the analysis from the zip and set the working directory to the base folder.
+
+#### Create ConnectomeDB account
+Follow the documentation
+
+#### Generate AWS credentials
+Follow the documentation
+
+#### Install s3cmd utility.
+This can be installed using python. It must be python 2.X. I manage versions with pyenv hence the first command below to switch the appropropriate python version on my system. To install:
+```
+pyenv shell 2.7.10
+pip install --upgrade pip
+pip install s3cmd
+```
+
+#### Configure s3cmd
+Help found [here](http://xmodulo.com/how-to-access-amazon-s3-cloud-storage-from-command-line-in-linux.html). The configuration writes a config file to the home directory. And is accessed during queries of the AWS bucket 's3://hcp-openaccess/HCP'. Once this is done `s3cmd ls` on the command line should list the buckets in the AWS account.
+
+
+
+#### A latex installation
+Errors will occur upon knitting if packages from Tex-live are missing. An example is the framed package (not included in the the basic tex installation on OSX). Error message mentions missing style or template file.
+
+
+
+
+## Using the s3cmd tool for AWS bucket download
+ As described in the human connectome [wiki](https://wiki.humanconnectome.org) the s3cmd tool is a useful tool for downloading from the AWS bucket. The original command I was attempting to use was:
+
+`s3cmd sync -rv --include 'stats/aseg.stats' --exclude '*' s3://hcp-openaccess/HCP/ ./HCP/`
+
+It would have been a nice solution to downloading the '.stat' files because it maintains the directory structure and additional directories can subsequently be populated as required. Additionally I would be more certain of the missing '.stat' files. In the current analysis I searched in the same directory for each subject: a reasonable approach but not immune to error. 
+
+Using the previously mentioned sync command  elicited a warning and executed painfully slowly. The error is detailed as an issue at the github [repository](https://github.com/s3tools/s3cmd/issues/314) and also discussed [here](http://stackoverflow.com/questions/5774808/s3cmd-failed-too-many-times). From what I gathered, its not a particularly useful warning and can be caused by a number of issues.
+
+Things I tried to know avail
+
++ Originally I installed version 1.6.0 using the homebrew package manager. I then used python to install the more recent 1.6.1.
+
++ I changed explicitly defined the bucket location as "us-east-1" and set my locale to en_US.
+
++ I tried the utility awscli. This had an issue in that it could not find the buckets. It required a url as input rather than the bucket name. I didn't think I could troubleshoot this rapidly enough 
+
+After this, I just resorted to writing a loop and searching for the file for each subject individually. When more restricted queries were used it took very little time to download the files.
+
+
+
